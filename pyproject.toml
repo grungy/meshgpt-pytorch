@@ -3,7 +3,24 @@ name = "meshgpt-pytorch"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
+    "beartype>=0.19.0",
+    "boto3>=1.36.11",
+    "classifier-free-guidance-pytorch>=0.7.1",
+    "einops>=0.8.0",
+    "einx>=0.3.0",
+    "ema-pytorch>=0.7.7",
+    "gateloop-transformer>=0.2.5",
+    "local-attention>=1.11.1",
+    "mlflow>=2.20.1",
+    "pytest>=8.3.4",
+    "pytorch-custom-utils>=0.0.21",
+    "taylor-series-linear-attention>=0.1.12",
+    "torch-geometric>=2.6.1",
     "torch>=2.6.0",
+    "torchtyping>=0.1.5",
+    "torchvision>=0.21.0",
+    "vector-quantize-pytorch>=1.21.4",
+    "x-transformers>=1.44.8",
 ]

@@ -14,7 +14,7 @@ from torch.cuda.amp import autocast
 from pytorch_custom_utils import save_load
 
 from beartype.typing import Tuple, Callable, List, Dict, Any
-from meshgpt.typing import Float, Int, Bool, typecheck
+from meshgpt_pytorch.typing import Float, Int, Bool, typecheck
 
 from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
 
@@ -39,8 +39,8 @@ from vector_quantize_pytorch import (
     ResidualLFQ
 )
 
-from meshgpt.data import derive_face_edges_from_faces
-from meshgpt.version import __version__
+from meshgpt_pytorch.data import derive_face_edges_from_faces
+from meshgpt_pytorch.version import __version__
 
 from taylor_series_linear_attention import TaylorSeriesLinearAttn
 
@@ -57,7 +57,7 @@ from tqdm import tqdm
 
 import logging
 
-from meshgpt import QuantizerMixin
+from meshgpt_pytorch.quantizer_mixin import QuantizerMixin
 
 __all__ = ['exists', 'default', 'first', 'identity', 'divisible_by', 'is_odd', 'is_empty', 
            'is_tensor_empty', 'set_module_requires_grad_', 'l1norm', 'l2norm', 'safe_cat', 
