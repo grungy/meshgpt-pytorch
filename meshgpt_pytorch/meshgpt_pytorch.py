@@ -54,318 +54,20 @@ from gateloop_transformer import SimpleGateLoopLayer
 
 from tqdm import tqdm
 
-# helper functions
+from meshgpt_pytorch.embedding_mixin import EmbeddingMixin
+from meshgpt_pytorch.quantizer_mixin import QuantizerMixin
+from meshgpt_pytorch.attention_mixin import AttentionMixin
 
-def exists(v):
-    return v is not None
+from meshgpt_pytorch.helpers import exists, default, is_tensor_empty, is_odd, get_derived_face_features, discretize, pad_at_dim, scatter_mean
 
-def default(v, d):
-    return v if exists(v) else d
+from meshgpt_pytorch.blocks import Block, ResnetBlock, SqueezeExcite
 
-def first(it):
-    return it[0]
-
-def divisible_by(num, den):
-    return (num % den) == 0
-
-def is_odd(n):
-    return not divisible_by(n, 2)
-
-def is_empty(l):
-    return len(l) == 0
-
-def is_tensor_empty(t: Tensor):
-    return t.numel() == 0
-
-def set_module_requires_grad_(
-    module: Module,
-    requires_grad: bool
-):
-    for param in module.parameters():
-        param.requires_grad = requires_grad
-
-def l1norm(t):
-    return F.normalize(t, dim = -1, p = 1)
-
-def l2norm(t):
-    return F.normalize(t, dim = -1, p = 2)
-
-def safe_cat(tensors, dim):
-    tensors = [*filter(exists, tensors)]
-
-    if len(tensors) == 0:
-        return None
-    elif len(tensors) == 1:
-        return first(tensors)
-
-    return torch.cat(tensors, dim = dim)
-
-def pad_at_dim(t, padding, dim = -1, value = 0):
-    ndim = t.ndim
-    right_dims = (ndim - dim - 1) if dim >= 0 else (-dim - 1)
-    zeros = (0, 0) * right_dims
-    return F.pad(t, (*zeros, *padding), value = value)
-
-def pad_to_length(t, length, dim = -1, value = 0, right = True):
-    curr_length = t.shape[dim]
-    remainder = length - curr_length
-
-    if remainder <= 0:
-        return t
-
-    padding = (0, remainder) if right else (remainder, 0)
-    return pad_at_dim(t, padding, dim = dim, value = value)
-
-# continuous embed
-
-def ContinuousEmbed(dim_cont):
-    return nn.Sequential(
-        Rearrange('... -> ... 1'),
-        nn.Linear(1, dim_cont),
-        nn.SiLU(),
-        nn.Linear(dim_cont, dim_cont),
-        nn.LayerNorm(dim_cont)
-    )
-
-# additional encoder features
-# 1. angle (3), 2. area (1), 3. normals (3)
-
-def derive_angle(x, y, eps = 1e-5):
-    z = einsum('... d, ... d -> ...', l2norm(x), l2norm(y))
-    return z.clip(-1 + eps, 1 - eps).arccos()
-
-@torch.no_grad()
-def get_derived_face_features(
-    face_coords: TensorType['b', 'nf', 3, 3, float]  # 3 vertices with 3 coordinates
-):
-    shifted_face_coords = torch.cat((face_coords[:, :, -1:], face_coords[:, :, :-1]), dim = 2)
-
-    angles  = derive_angle(face_coords, shifted_face_coords)
-
-    edge1, edge2, _ = (face_coords - shifted_face_coords).unbind(dim = 2)
-
-    normals = l2norm(torch.cross(edge1, edge2, dim = -1))
-    area = normals.norm(dim = -1, keepdim = True) * 0.5
-
-    return dict(
-        angles = angles,
-        area = area,
-        normals = normals
-    )   
-
-# tensor helper functions
-
-@beartype
-def discretize(
-    t: Tensor,
-    *,
-    continuous_range: Tuple[float, float],
-    num_discrete: int = 128
-) -> Tensor:
-    lo, hi = continuous_range
-    assert hi > lo
-
-    t = (t - lo) / (hi - lo)
-    t *= num_discrete
-    t -= 0.5
-
-    return t.round().long().clamp(min = 0, max = num_discrete - 1)
-
-@beartype
-def undiscretize(
-    t: Tensor,
-    *,
-    continuous_range = Tuple[float, float],
-    num_discrete: int = 128
-) -> Tensor:
-    lo, hi = continuous_range
-    assert hi > lo
-
-    t = t.float()
-
-    t += 0.5
-    t /= num_discrete
-    return t * (hi - lo) + lo
-
-@beartype
-def gaussian_blur_1d(
-    t: Tensor,
-    *,
-    sigma: float = 1.
-) -> Tensor:
-
-    _, _, channels, device, dtype = *t.shape, t.device, t.dtype
-
-    width = int(ceil(sigma * 5))
-    width += (width + 1) % 2
-    half_width = width // 2
-
-    distance = torch.arange(-half_width, half_width + 1, dtype = dtype, device = device)
-
-    gaussian = torch.exp(-(distance ** 2) / (2 * sigma ** 2))
-    gaussian = l1norm(gaussian)
-
-    kernel = repeat(gaussian, 'n -> c 1 n', c = channels)
-
-    t = rearrange(t, 'b n c -> b c n')
-    out = F.conv1d(t, kernel, padding = half_width, groups = channels)
-    return rearrange(out, 'b c n -> b n c')
-
-@beartype
-def scatter_mean(
-    tgt: Tensor,
-    indices: Tensor,
-    src = Tensor,
-    *,
-    dim: int = -1,
-    eps: float = 1e-5
-):
-    """
-    todo: update to pytorch 2.1 and try https://pytorch.org/docs/stable/generated/torch.Tensor.scatter_reduce_.html#torch.Tensor.scatter_reduce_
-    """
-    num = tgt.scatter_add(dim, indices, src)
-    den = torch.zeros_like(tgt).scatter_add(dim, indices, torch.ones_like(src))
-    return num / den.clamp(min = eps)
-
-# resnet block
-
-class SqueezeExcite(Module):
-    def __init__(
-        self,
-        dim,
-        reduction_factor = 4,
-        min_dim = 16
-    ):
-        super().__init__()
-        dim_inner = max(dim // reduction_factor, min_dim)
-
-        self.net = nn.Sequential(
-            nn.Linear(dim, dim_inner),
-            nn.SiLU(),
-            nn.Linear(dim_inner, dim),
-            nn.Sigmoid(),
-            Rearrange('b c -> b c 1')
-        )
-
-    def forward(self, x, mask = None):
-        if exists(mask):
-            x = x.masked_fill(~mask, 0.)
-
-            num = reduce(x, 'b c n -> b c', 'sum')
-            den = reduce(mask.float(), 'b 1 n -> b 1', 'sum')
-            avg = num / den.clamp(min = 1e-5)
-        else:
-            avg = reduce(x, 'b c n -> b c', 'mean')
-
-        return x * self.net(avg)
-
-class Block(Module):
-    def __init__(
-        self,
-        dim,
-        dim_out = None,
-        groups = 8,
-        dropout = 0.
-    ):
-        super().__init__()
-        dim_out = default(dim_out, dim)
-
-        self.proj = nn.Conv1d(dim, dim_out, 3, padding = 1)
-        self.norm = nn.GroupNorm(groups, dim_out)
-        self.dropout = nn.Dropout(dropout)
-        self.act = nn.SiLU()
-
-    def forward(self, x, mask = None):
-        if exists(mask):
-            x = x.masked_fill(~mask, 0.)
-
-        x = self.proj(x)
-
-        if exists(mask):
-            x = x.masked_fill(~mask, 0.)
-
-        x = self.norm(x)
-        x = self.act(x)
-        x = self.dropout(x)
-
-        return x
-
-class ResnetBlock(Module):
-    def __init__(
-        self,
-        dim,
-        dim_out = None,
-        *,
-        groups = 8,
-        dropout = 0.
-    ):
-        super().__init__()
-        dim_out = default(dim_out, dim)
-        self.block1 = Block(dim, dim_out, groups = groups, dropout = dropout)
-        self.block2 = Block(dim_out, dim_out, groups = groups, dropout = dropout)
-        self.excite = SqueezeExcite(dim_out)
-        self.residual_conv = nn.Conv1d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
-
-    def forward(
-        self,
-        x,
-        mask = None
-    ):
-        res = self.residual_conv(x)
-        h = self.block1(x, mask = mask)
-        h = self.block2(h, mask = mask)
-        h = self.excite(h, mask = mask)
-        return h + res
-
-# gateloop layers
-
-class GateLoopBlock(Module):
-    def __init__(
-        self,
-        dim,
-        *,
-        depth,
-        use_heinsen = True
-    ):
-        super().__init__()
-        self.gateloops = ModuleList([])
-
-        for _ in range(depth):
-            gateloop = SimpleGateLoopLayer(dim = dim, use_heinsen = use_heinsen)
-            self.gateloops.append(gateloop)
-
-    def forward(
-        self,
-        x,
-        cache = None
-    ):
-        received_cache = exists(cache)
-
-        if is_tensor_empty(x):
-            return x, None
-
-        if received_cache:
-            prev, x = x[:, :-1], x[:, -1:]
-
-        cache = default(cache, [])
-        cache = iter(cache)
-
-        new_caches = []
-        for gateloop in self.gateloops:
-            layer_cache = next(cache, None)
-            out, new_cache = gateloop(x, cache = layer_cache, return_cache = True)
-            new_caches.append(new_cache)
-            x = x + out
-
-        if received_cache:
-            x = torch.cat((prev, x), dim = -2)
-
-        return x, new_caches
+from meshgpt_pytorch.gateloop_layers import GateLoopBlock
 
 # main classes
 
 @save_load(version = __version__)
-class MeshAutoencoder(Module):
+class MeshAutoencoder(Module, EmbeddingMixin, QuantizerMixin, AttentionMixin):
     @beartype
     def __init__(
         self,
@@ -432,35 +134,9 @@ class MeshAutoencoder(Module):
         checkpoint_quantizer = False
     ):
         super().__init__()
-
-        # main face coordinate embedding
-
-        self.num_discrete_coors = num_discrete_coors
-        self.coor_continuous_range = coor_continuous_range
-
-        self.discretize_face_coords = partial(discretize, num_discrete = num_discrete_coors, continuous_range = coor_continuous_range)
-        self.coor_embed = nn.Embedding(num_discrete_coors, dim_coor_embed)
-
-        # derived feature embedding
-
-        self.discretize_angle = partial(discretize, num_discrete = num_discrete_angle, continuous_range = (0., pi))
-        self.angle_embed = nn.Embedding(num_discrete_angle, dim_angle_embed)
-
-        lo, hi = coor_continuous_range
-        self.discretize_area = partial(discretize, num_discrete = num_discrete_area, continuous_range = (0., (hi - lo) ** 2))
-        self.area_embed = nn.Embedding(num_discrete_area, dim_area_embed)
-
-        self.discretize_normals = partial(discretize, num_discrete = num_discrete_normals, continuous_range = coor_continuous_range)
-        self.normal_embed = nn.Embedding(num_discrete_normals, dim_normal_embed)
-
-        # attention related
-
-        attn_kwargs = dict(
-            causal = False,
-            prenorm = True,
-            dropout = attn_dropout,
-            window_size = local_attn_window_size,
-        )
+        EmbeddingMixin.__init__(self, num_discrete_coors, dim_coor_embed, num_discrete_angle, dim_angle_embed, num_discrete_area, dim_area_embed, num_discrete_normals, dim_normal_embed, coor_continuous_range)
+        QuantizerMixin.__init__(self, dim_codebook, num_quantizers, codebook_size, use_residual_lfq, rq_kwargs, rvq_kwargs, rlfq_kwargs, rvq_stochastic_sample_codes, checkpoint_quantizer)
+        AttentionMixin.__init__(self, attn_encoder_depth, attn_decoder_depth, local_attn_kwargs, local_attn_window_size, linear_attn_kwargs, use_linear_attn, flash_attn, attn_dropout, ff_dropout)
 
         # initial dimension
 
@@ -504,38 +180,6 @@ class MeshAutoencoder(Module):
                 LocalMHA(dim = curr_dim, **attn_kwargs, **local_attn_kwargs),
                 nn.Sequential(RMSNorm(curr_dim), FeedForward(curr_dim, glu = True, dropout = ff_dropout))
             ]))
-
-        # residual quantization
-
-        self.codebook_size = codebook_size
-        self.num_quantizers = num_quantizers
-
-        self.project_dim_codebook = nn.Linear(curr_dim, dim_codebook * 3)
-
-        if use_residual_lfq:
-            self.quantizer = ResidualLFQ(
-                dim = dim_codebook,
-                num_quantizers = num_quantizers,
-                codebook_size = codebook_size,
-                commitment_loss_weight = 1.,
-                **rlfq_kwargs,
-                **rq_kwargs
-            )
-        else:
-            self.quantizer = ResidualVQ(
-                dim = dim_codebook,
-                num_quantizers = num_quantizers,
-                codebook_size = codebook_size,
-                shared_codebook = True,
-                commitment_weight = 1.,
-                stochastic_sample_codes = rvq_stochastic_sample_codes,
-                **rvq_kwargs,
-                **rq_kwargs
-            )
-
-        self.checkpoint_quantizer = checkpoint_quantizer # whether to memory checkpoint the quantizer
-
-        self.pad_id = pad_id # for variable lengthed faces, padding quantized ids will be set to this value
 
         # decoder
 
@@ -1284,7 +928,7 @@ class MeshTransformer(Module):
             assert exists(texts) ^ exists(text_embeds), '`text` or `text_embeds` must be passed in if `condition_on_text` is set to True'
 
             if exists(texts):
-                text_embeds = self.conditioner.embed_texts(texts)
+                text_embeds = self.embed_texts(texts)
 
             if exists(codes):
                 assert text_embeds.shape[0] == codes.shape[0], 'batch size of texts or text embeddings is not equal to the batch size of the mesh codes'
